@@ -1,150 +1,202 @@
-
 /**
  * send_daily_wweb.js
- * - Uses whatsapp-web.js + LocalAuth for persistent login
- * - Internal scheduler (node-cron) to run daily at configured time (default 09:00 Asia/Kolkata)
- * - Rotates quotes by day-of-year
- * - Sends image (by URL) with caption to each contact
- * - Throttles, retries, logs
+ * Production-ready autopilot for sending daily quotes via WhatsApp (whatsapp-web.js)
+ *
+ * Requirements:
+ *  - quotes_cloudinary.json (array of { text, image })
+ *  - contacts.json (array of { name, phone })
+ *  - unsubscribe_handler.js (optional, will be required if present)
+ *  - Environment variables (set in Render or .env locally):
+ *      CRON_SCHEDULE (e.g. "30 5 * * *")
+ *      CRON_TIMEZONE (e.g. "Asia/Kolkata")
+ *      PORT (optional)
+ *
+ * Usage: node send_daily_wweb.js
  */
 
+require('dotenv').config();
 const fs = require('fs');
 const path = require('path');
-const { Client, LocalAuth, MessageMedia } = require('whatsapp-web.js');
-const qrcode = require('qrcode-terminal');
-const fetch = require('node-fetch');
-const pRetry = require('p-retry');
-const winston = require('winston');
 const cron = require('node-cron');
-require('dotenv').config();
+const express = require('express');
+const qrcode = require('qrcode');
+const { Client, LocalAuth } = require('whatsapp-web.js');
 
-const LOG_DIR = path.join(__dirname, 'logs');
-if (!fs.existsSync(LOG_DIR)) fs.mkdirSync(LOG_DIR);
+const LOG_FILE = path.join(__dirname, 'send_log.log');
+const QUOTES_FILE = path.join(__dirname, 'quotes_cloudinary.json');
+const CONTACTS_FILE = path.join(__dirname, 'contacts.json');
 
-// Logger
-const logger = winston.createLogger({
-  level: 'info',
-  format: winston.format.combine(
-    winston.format.timestamp({ format: 'YYYY-MM-DD HH:mm:ss' }),
-    winston.format.printf(info => `${info.timestamp} ${info.level.toUpperCase()}: ${info.message}`)
-  ),
-  transports: [
-    new winston.transports.File({ filename: path.join(LOG_DIR, 'whatsapp.log') }),
-    new winston.transports.Console()
-  ]
+function log(...args) {
+  const line = `[${new Date().toISOString()}] ${args.join(' ')}`;
+  console.log(line);
+  try { fs.appendFileSync(LOG_FILE, line + '\n'); } catch(e){}
+}
+
+// --- Express keep-alive + QR endpoint setup ---
+const app = express();
+let currentQR = null; // data URL
+
+app.get('/', (req, res) => res.send('✅ WhatsApp Autopilot running'));
+app.get('/qr', (req, res) => {
+  if (!currentQR) return res.status(404).send('QR not ready yet — try again in a few seconds.');
+  const html = `
+    <html>
+      <body style="display:flex;justify-content:center;align-items:center;height:100vh;background:#0b0b0b;margin:0">
+        <div style="text-align:center;">
+          <img src="${currentQR}" style="width:360px;height:360px;border:6px solid #fff;border-radius:8px;display:block;margin:0 auto"/>
+          <p style="color:#fff;font-family:Arial,Helvetica,sans-serif">Scan this QR with WhatsApp → Linked Devices → Link a Device</p>
+        </div>
+      </body>
+    </html>`;
+  res.send(html);
 });
 
-const CONTACTS = JSON.parse(fs.readFileSync(path.join(__dirname, 'contacts.json')));
-const QUOTES = JSON.parse(fs.readFileSync(path.join(__dirname, 'quotes.json')));
+// optional status route
+app.get('/status', (req, res) => res.json({ ready: !!clientReadyFlag, quotes: safeLoadQuotes().length }));
 
-// Scheduler: default cron schedule '0 9 * * *' (09:00 daily). You can override via .env CRON_SCHEDULE
-const CRON_SCHEDULE = process.env.CRON_SCHEDULE || '0 9 * * *';
-const CRON_TIMEZONE = process.env.CRON_TIMEZONE || 'Asia/Kolkata';
-
-function getDayOfYear(d = new Date()) {
-  const start = new Date(d.getFullYear(), 0, 0);
-  const diff = d - start;
-  const oneDay = 1000 * 60 * 60 * 24;
-  return Math.floor(diff / oneDay);
-}
-
-function selectQuoteForToday() {
-  const idx = getDayOfYear() % QUOTES.length;
-  return QUOTES[idx];
-}
-
+// --- WhatsApp client init ---
 const client = new Client({
-  authStrategy: new LocalAuth({ clientId: 'spiritual-daily-session' }),
-  puppeteer: { headless: true, args: ['--no-sandbox', '--disable-setuid-sandbox'] }
-});
-
-client.on('qr', qr => {
-  logger.info('QR code received — scan with WhatsApp mobile app (Linked Devices -> Link a device).');
-  qrcode.generate(qr, { small: true });
-});
-
-client.on('ready', () => {
-  logger.info('WhatsApp client ready. Scheduling daily job: ' + CRON_SCHEDULE + ' TZ=' + CRON_TIMEZONE);
-  // Schedule the job
-  cron.schedule(CRON_SCHEDULE, async () => {
-    logger.info('Cron triggered: sending today\'s quote.');
-    await runSendLoop();
-  }, { timezone: CRON_TIMEZONE });
-  logger.info('Scheduler initialized. Waiting for first run.');
-});
-
-// helper: sleep ms
-function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
-
-// helper: format chat id
-function toChatId(phone) { const digits = phone.replace(/\D/g, ''); return `${digits}@c.us`; }
-
-// fetch remote URL and convert to MessageMedia
-async function fetchMediaFromUrl(url) {
-  return await pRetry(async () => {
-    const res = await fetch(url);
-    if (!res.ok) throw new Error('Image fetch failed: ' + res.status);
-    const buffer = await res.buffer();
-    const mime = res.headers.get('content-type') || 'image/jpeg';
-    const base64 = buffer.toString('base64');
-    const data = `data:${mime};base64,${base64}`;
-    return MessageMedia.fromDataURL(data);
-  }, { retries: 2 });
-}
-
-async function sendToContact(contact, quote) {
-  const chatId = toChatId(contact.phone);
-  const caption = `Hi ${contact.name},\n\n${quote.text}`;
-  const media = await fetchMediaFromUrl(quote.image);
-  if (!media) throw new Error('Failed to fetch media');
-  return client.sendMessage(chatId, media, { caption });
-}
-
-async function runSendLoop() {
-  const quote = selectQuoteForToday();
-  logger.info('Selected quote: ' + quote.text);
-  for (const c of CONTACTS) {
-    try {
-      await pRetry(() => sendToContact(c, quote), { retries: 2, factor: 1.4 });
-      logger.info(`Sent to ${c.phone}`);
-    } catch (err) {
-      logger.error(`Failed to send to ${c.phone}: ${err.message}`);
-    }
-    await sleep(2000 + Math.floor(Math.random() * 1500));
+  authStrategy: new LocalAuth({ clientId: "autopilot" }),
+  puppeteer: {
+    headless: true,
+    args: [
+      '--no-sandbox',
+      '--disable-setuid-sandbox',
+      '--disable-dev-shm-usage',
+      '--disable-accelerated-2d-canvas',
+      '--no-first-run',
+      '--no-zygote',
+      '--single-process',
+      '--disable-gpu'
+    ]
   }
-  logger.info('Send loop completed.');
-}
+});
 
+let clientReadyFlag = false;
 
-// Unsubscribe / incoming message handler
-// If a contact texts "STOP", "UNSUBSCRIBE", or similar, we'll remove them from contacts.json and confirm.
-client.on('message', async msg => {
+// QR event -> store PNG data URL for browser route
+client.on('qr', async (qr) => {
   try {
-    const body = (msg.body || '').trim().toLowerCase();
-    const stopKeywords = ['stop', 'unsubscribe', 'stop messages', 'stop now', 'cancel'];
-    if (stopKeywords.includes(body)) {
-      // derive phone from msg.from (format like '9199xxxxxxx@c.us' or '9199xxxxxxx@us')
-      const from = msg.from || '';
-      const phone = from.split('@')[0];
-      if (!phone) return;
-      const contactsPath = path.join(__dirname, 'contacts.json');
-      const contacts = JSON.parse(fs.readFileSync(contactsPath, 'utf8'));
-      const idx = contacts.findIndex(c => c.phone.replace(/\\D/g,'') === phone.replace(/\\D/g,''));
-      if (idx !== -1) {
-        const removed = contacts.splice(idx, 1)[0];
-        fs.writeFileSync(contactsPath, JSON.stringify(contacts, null, 2), 'utf8');
-        logger.info(`Unsubscribed and removed ${removed.name} (${removed.phone}) via STOP message.`);
-        await msg.reply('You have been unsubscribed from daily messages. If this was a mistake, reply JOIN or contact the sender.');
-      } else {
-        // If not found by exact phone, try matching by name in message (not typical)
-        await msg.reply('We did not find your number in the subscription list. If you want to unsubscribe, reply STOP from the subscribed number.');
-      }
-    } else if (body === 'join' || body === 'start') {
-      await msg.reply('To subscribe, please ask the sender to add your number. This account accepts subscriptions only from the owner.');
-    }
-  } catch (e) {
-    logger.error('Error processing incoming message: ' + (e.message || e));
+    currentQR = await qrcode.toDataURL(qr);
+    log('QR ready — open /qr to scan.');
+  } catch (err) {
+    console.error('QR -> dataURL error', err);
   }
 });
 
-client.initialize();
+// ready event
+client.on('ready', () => {
+  clientReadyFlag = true;
+  log('WhatsApp client ready. Scheduling daily job:', process.env.CRON_SCHEDULE || '30 5 * * *', 'TZ=' + (process.env.CRON_TIMEZONE || 'Asia/Kolkata'));
+  // clear stored QR once ready
+  currentQR = null;
+});
+
+// handle auth failure
+client.on('auth_failure', (msg) => {
+  log('Auth failure:', msg);
+});
+
+// ensure unsubscribe handler if exists
+try {
+  const registerUnsubscribe = require('./unsubscribe_handler');
+  registerUnsubscribe(client);
+  log('unsubscribe_handler loaded');
+} catch (e) {
+  log('No unsubscribe_handler found — skipping (optional)');
+}
+
+// helper: load quotes & contacts safely
+function safeLoadQuotes() {
+  try {
+    const raw = fs.readFileSync(QUOTES_FILE, 'utf8');
+    const arr = JSON.parse(raw);
+    if (!Array.isArray(arr)) return [];
+    return arr;
+  } catch (e) {
+    return [];
+  }
+}
+function safeLoadContacts() {
+  try {
+    const raw = fs.readFileSync(CONTACTS_FILE, 'utf8');
+    const arr = JSON.parse(raw);
+    if (!Array.isArray(arr)) return [];
+    return arr;
+  } catch (e) {
+    return [];
+  }
+}
+
+// send one quote to all contacts (index input)
+async function sendQuoteToAll(index = 0) {
+  const quotes = safeLoadQuotes();
+  const contacts = safeLoadContacts();
+  if (!quotes.length) {
+    log('No quotes found to send.');
+    return;
+  }
+  const q = quotes[index % quotes.length];
+  log(`Sending quote index ${index} -> "${q.text?.slice(0,80)}..." to ${contacts.length} contacts`);
+  for (const c of contacts) {
+    try {
+      if (!c.phone) { log('Skipping contact missing phone:', JSON.stringify(c)); continue; }
+      const phoneDigits = c.phone.replace(/\D/g,'');
+      if (!phoneDigits) continue;
+      const chatId = phoneDigits + '@c.us';
+      await client.sendMessage(chatId, { url: q.image }, { caption: q.text });
+      log('Sent to', c.name || phoneDigits);
+    } catch (err) {
+      log('Send failed for', c.name || c.phone, '->', err.message || err);
+    }
+  }
+}
+
+// Scheduler setup
+function startScheduler() {
+  const scheduleExpr = process.env.CRON_SCHEDULE || '30 5 * * *';
+  const tz = process.env.CRON_TIMEZONE || 'Asia/Kolkata';
+  try {
+    cron.schedule(scheduleExpr, async () => {
+      try {
+        if (!clientReadyFlag) { log('Client not ready yet — skipping scheduled send'); return; }
+        // pick a rotating index based on day (or use random)
+        const quotes = safeLoadQuotes();
+        if (!quotes.length) { log('No quotes to send.'); return; }
+        const dayIndex = Math.floor((Date.now() / (1000 * 60 * 60 * 24))) % quotes.length;
+        await sendQuoteToAll(dayIndex);
+        log('Scheduled run complete.');
+      } catch (inner) {
+        log('Scheduled run error:', inner.message || inner);
+      }
+    }, { timezone: tz });
+    log('Scheduler initialized. Waiting for first run.');
+  } catch (e) {
+    log('Failed to initialize cron:', e.message || e);
+  }
+}
+
+// start express server
+const PORT = process.env.PORT || 10000;
+app.listen(PORT, () => {
+  log(`Keep-alive & QR server running on port ${PORT}`);
+});
+
+// initialize WhatsApp client and scheduler
+client.initialize().then(() => {
+  startScheduler();
+}).catch(err => {
+  log('client.initialize() error', err);
+});
+
+// graceful shutdown
+process.on('SIGINT', async () => {
+  log('SIGINT received — shutting down');
+  try { await client.destroy(); } catch(e){}
+  process.exit(0);
+});
+process.on('SIGTERM', async () => {
+  log('SIGTERM received — shutting down');
+  try { await client.destroy(); } catch(e){}
+  process.exit(0);
+});
