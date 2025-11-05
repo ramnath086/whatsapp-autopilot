@@ -1,21 +1,31 @@
 {
-  "name": "whatsapp-spiritual-autopilot",
+  "name": "whatsapp-autopilot",
   "version": "1.0.0",
-  "description": "Autopilot daily spiritual motivational quotes poster using whatsapp-web.js (LocalAuth) with inspirational photo backgrounds and internal scheduler.",
+  "description": "Automated daily WhatsApp sender using whatsapp-web.js, Cloudinary images, and cron scheduler.",
   "main": "send_daily_wweb.js",
   "scripts": {
-    "start": "node send_daily_wweb.js",
-    "dev": "node send_daily_wweb.js"
+    "start": "node send_daily_wweb.js"
   },
   "dependencies": {
-    "cloudinary": "^2.8.0",
-    "dotenv": "^16.6.1",
-    "node-cron": "^3.0.2",
-    "node-fetch": "^2.7.0",
-    "p-retry": "^4.6.2",
-    "qrcode-terminal": "^0.12.0",
-    "streamifier": "^0.1.1",
-    "whatsapp-web.js": "^1.20.0",
-    "winston": "^3.8.2"
-  }
+    "dotenv": "^16.4.1",
+    "express": "^4.19.2",
+    "node-cron": "^3.0.3",
+    "qrcode": "^1.5.3",
+    "whatsapp-web.js": "^1.24.0"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "keywords": [
+    "whatsapp",
+    "automation",
+    "cloudinary",
+    "daily-quotes",
+    "spiritual",
+    "scheduler",
+    "express",
+    "cron"
+  ],
+  "author": "Ramanathan",
+  "license": "MIT"
 }
